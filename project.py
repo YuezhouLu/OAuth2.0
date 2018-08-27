@@ -3,8 +3,7 @@ from sqlalchemy import create_engine, asc
 from sqlalchemy.orm import sessionmaker
 from database_setup import Base, Restaurant, MenuItem, User
 from flask import session as login_session
-import random
-import string
+import random, string
 from oauth2client.client import flow_from_clientsecrets
 from oauth2client.client import FlowExchangeError
 import httplib2
@@ -113,6 +112,8 @@ def gconnect():
     # Stored the answer including user info from Google in 'data' variable in JSON format.
     data = answer.json()
 
+    # ADD PROVIDER TO LOGIN SESSION.
+    login_session['provider'] = 'google'
     # Store the user info in the session for later use. (stored for output below and the /gdisconnect method to use)
     login_session['username'] = data['name']
     login_session['picture'] = data['picture']
@@ -130,9 +131,82 @@ def gconnect():
     output += '<img src="'
     output += login_session['picture']
     output += ' " style = "width: 300px; height: 300px;border-radius: 150px;-webkit-border-radius: 150px;-moz-border-radius: 150px;"> '
-    flash("you are now logged in as %s" % login_session['username'])
+    flash("You are now logged in as %s" % login_session['username'])
     print "done!" # Print to the console/terminal!
     return output # Return the output stuff to the 'result' variable of the success function in the login.html template.
+
+
+@app.route('/fbconnect', methods = ['POST'])
+def fbconnnect():
+    # Validate state token.
+    if request.args.get('state') != login_session['state']:
+        response = make_response(json.dumps('Invalid state parameter.'), 401)
+        response.headers['Content-Type'] = 'application/json'
+        return response
+
+
+    access_token = request.data # This access_token is same as the one-time code in the Google case
+    print "access token received %s " % access_token
+
+    # The following process is like upgrading the authorization code into a credentials object in gconnect.
+    app_id = json.loads(open('fb_client_secrets.json', 'r').read())['web']['app_id']
+    app_secret = json.loads(open('fb_client_secrets.json', 'r').read())['web']['app_secret']
+    url = 'https://graph.facebook.com/oauth/access_token?grant_type=fb_exchange_token&client_id=%s&client_secret=%s&fb_exchange_token=%s' % (
+        app_id, app_secret, access_token)
+    h = httplib2.Http()
+    result = h.request(url, 'GET')[1] # result here is same as the credentials in gconnect.
+    token = result.split(',')[0].split(':')[1].replace('"', '') # token here is same the access_token in gconnect.
+
+
+    # In fbconnect, there is not any process for validating the token info like in gconnect (those if functions).
+    # Skipped
+
+
+    # Use token to get user info from API
+    userinfo_url = "https://graph.facebook.com/v3.1/me"
+    '''
+        Due to the formatting for the result from the server token exchange we have to
+        split the token first on commas and select the first index which gives us the key : value
+        for the server access token then we split it on colons to pull out the actual token value
+        and replace the remaining quotes with nothing so that it can be used directly in the graph
+        api calls
+    '''
+
+    url = 'https://graph.facebook.com/v3.1/me?access_token=%s&fields=name,id,email' % token
+    h = httplib2.Http()
+    result = h.request(url, 'GET')[1]
+    print "url sent for API access:%s"% url
+    print "API JSON result: %s" % result
+    data = json.loads(result)
+    login_session['provider'] = 'facebook' # Refactor the code to determine which provider the user was logged into and then proceed to log them out.
+    login_session['username'] = data["name"]
+    login_session['email'] = data["email"]
+    login_session['facebook_id'] = data["id"] # This is like the gplus_id in gconnect.
+    login_session['access_token'] = token # The token must be stored in the login_session in order to properly log out.
+
+    # Get user picture (seperately in the case of Facebook sign in).
+    url = 'https://graph.facebook.com/v3.1/me/picture?access_token=%s&redirect=0&height=200&width=200' % token
+    h = httplib2.Http()
+    result = h.request(url, 'GET')[1]
+    data = json.loads(result)
+    login_session['picture'] = data["data"]["url"]
+
+
+    # see if user exists
+    user_id = getUserID(login_session['email'])
+    if not user_id:
+        user_id = createUser(login_session)
+    login_session['user_id'] = user_id
+
+    output = ''
+    output += '<h1>Welcome, '
+    output += login_session['username']
+    output += '!</h1>'
+    output += '<img src="'
+    output += login_session['picture']
+    output += ' " style = "width: 300px; height: 300px;border-radius: 150px;-webkit-border-radius: 150px;-moz-border-radius: 150px;"> '
+    flash("Now logged in as %s" % login_session['username'])
+    return output
 
 
 # User Helper Functions
@@ -157,7 +231,7 @@ def getUserInfo(user_id):
 
 
 
-# DISCONNECT - Revoke a current user's token and reset their login_session
+# DISCONNECT - Revoke a current user's token on the Google server.
 @app.route('/gdisconnect')
 def gdisconnect():
     access_token = login_session.get('access_token')
@@ -175,7 +249,7 @@ def gdisconnect():
 
     # Delete/revoke/disable user access token online (from Google).
     # Execute HTTP GET request to revoke current token.
-    url = 'https://accounts.google.com/o/oauth2/revoke?token=%s' % login_session['access_token']
+    url = 'https://accounts.google.com/o/oauth2/revoke?token=%s' % access_token
     h = httplib2.Http()
     result = h.request(url, 'GET')[0]
     # This result is the first ([0]) part of results sent from Google after server requests Google to revoke the current token.
@@ -186,11 +260,11 @@ def gdisconnect():
     if result['status'] == '200': # If Google successfully revokes the access token,
         # therefore we can now delete infos and token stored in our local server.
         # Reset the user's session.
-        del login_session['access_token']
-        del login_session['gplus_id']
-        del login_session['username']
-        del login_session['email']
-        del login_session['picture']
+        # del login_session['access_token']
+        # del login_session['gplus_id']
+        # del login_session['username']
+        # del login_session['email']
+        # del login_session['picture']
         response = make_response(json.dumps('Successfully disconnected.'), 200)
         response.headers['Content-Type'] = 'application/json'
         return response
@@ -198,6 +272,42 @@ def gdisconnect():
         response = make_response(json.dumps('Google failed to revoke token for given user.', 400))
         response.headers['Content-Type'] = 'application/json'
         return response
+
+
+# DISCONNECT - Revoke a current user's id and token on the Facebook server.
+@app.route('/fbdisconnect')
+def fbdisconnect():
+    facebook_id = login_session['facebook_id']
+    access_token = login_session['access_token'] # The access token must also be included to successfully log out.
+    url = 'https://graph.facebook.com/%s/permissions?access_token=%s' % (facebook_id,access_token)
+    h = httplib2.Http()
+    result = h.request(url, 'DELETE')[1]
+    return "you have been logged out"
+
+
+# Disconnect based on provider (no need to call gdisconnect or fbdisconnect anymore,
+# and reset current user's login_session (locally or on our App server).
+@app.route('/disconnect')
+def disconnect():
+    if 'provider' in login_session:
+        if login_session['provider'] == 'google':
+            gdisconnect()
+            del login_session['gplus_id']
+            del login_session['access_token']
+        if login_session['provider'] == 'facebook':
+            fbdisconnect()
+            del login_session['facebook_id']
+        del login_session['username']
+        del login_session['email']
+        del login_session['picture']
+        del login_session['user_id']
+        del login_session['provider']
+        flash("You have successfully been logged out.")
+        return redirect(url_for('showRestaurants'))
+    # else:
+    #     flash("You were not logged in")
+    #     return redirect(url_for('showRestaurants'))
+
 
 
 # JSON APIs to view Restaurant Information
@@ -369,3 +479,4 @@ if __name__ == '__main__':
     app.secret_key = 'super_secret_key'
     app.debug = True
     app.run(host='0.0.0.0', port=5000)
+    # ssl_context='adhoc' for running on https.
